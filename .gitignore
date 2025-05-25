@@ -1,0 +1,6 @@
+trainENV/
+sft_second_llm/
+processed_dataset/
+unfiltered_dataset/
+model/
+mathlib4/

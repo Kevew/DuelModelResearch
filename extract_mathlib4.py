@@ -144,8 +144,6 @@ def main():
     all_theorems = []
 
     for idx, file_path in enumerate(lean_files_to_scan):
-        if idx > 3200:
-            break
         if (idx + 1) % 100 == 0 or (idx + 1) == total_files:
             relative_file_path = os.path.relpath(file_path, mathlib_path)
             print(f"Processing file ({idx + 1}/{total_files}): {relative_file_path}")

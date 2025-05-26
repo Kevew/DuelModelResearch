@@ -12,6 +12,8 @@ from transformers import (
 )
 from datasets import Dataset
 
+# Use torchrun --nproc_per_node=2 train_state_to_state.py
+
 # Configuration
 MODEL_NAME = "model"
 TRAIN_FILE = "dataset_001.jsonl"
@@ -109,7 +111,7 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, local_files_only=True)
     tokenizer.pad_token = tokenizer.eos_token
     model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, local_files_only=True)
-    model.gradient_checkpointing_enable()
+    model.gradient_checkpointing_disable()
 
 
     tokenized = dataset.map(
@@ -137,12 +139,19 @@ def main():
         per_device_eval_batch_size=BATCH_SIZE,
         learning_rate=LR,
         num_train_epochs=EPOCHS,
-        evaluation_strategy="epoch",
+        eval_strategy="epoch",
         save_strategy="epoch",
-        logging_steps=100,
+        logging_steps=1,
         save_total_limit=2,
         bf16=True,
-        deepspeed="ds_config.json"
+        deepspeed={
+            "zero_optimization": {
+                "stage": 2,
+                "offload_optimizer": { "device": "cpu" }
+            },
+            "train_batch_size": "auto",
+            "bf16": { "enabled": True }
+        }
     )
 
     trainer = Trainer(
@@ -154,7 +163,12 @@ def main():
     )
 
     # Train and save
+    print("IT's TRAINIGN TIME BABY")
     trainer.train()
+
+    metrics = trainer.evaluate()
+    print(metrics)
+
     trainer.save_model(OUTPUT_DIR)
 
 

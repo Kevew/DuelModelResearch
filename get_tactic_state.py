@@ -2,6 +2,21 @@ import json
 import re
 import os
 from lean_interact import LeanREPLConfig, LeanServer, Command, TempRequireProject, LeanRequire
+import argparse
+
+PROGRESS_FILE = "progress.json"
+
+def load_progress():
+    if os.path.exists(PROGRESS_FILE):
+        with open(PROGRESS_FILE, 'r') as f:
+            return json.load(f)
+    return {}
+
+
+def save_progress(progress):
+    with open(PROGRESS_FILE, 'w') as f:
+        json.dump(progress, f)
+
 
 def extract_traced_states(resp, lines):
     """Collects goal states from resp.infotree: all goalsBefore plus final goalsAfter, and captures "Goals accomplished!"."""
@@ -29,6 +44,9 @@ def get_tactic_states_from_lean_code(lean_code: str, project_path: str = "."):
 
     Send the entire proof in one command, then walk through infotree to record each intermediate goal.
     """
+    if 'have?' in lean_code:
+        print("Skipping proof containing 'have?'")
+        return None
     lines = lean_code.splitlines()
     try:
         header_idx = next(i for i, l in enumerate(lines) if l.strip().endswith(':= by'))
@@ -78,21 +96,37 @@ def get_tactic_states_from_lean_code(lean_code: str, project_path: str = "."):
 
 
 if __name__ == "__main__":
+
+    parser = argparse.ArgumentParser(
+        description="Process a single Lean dataset file to extract tactic states."
+    )
+    parser.add_argument(
+        'filename',
+        help="Name of the file inside 'unfiltered_dataset/' to process (e.g. dataset_001.jsonl)"
+    )
+    args = parser.parse_args()
+
+    target = args.filename
+
+    all_files = os.listdir("unfiltered_dataset")
+    if target not in all_files:
+        print(f"Error: '{target}' not found in '{INPUT_FOLDER}'. Available files: {all_files}")
+
     input_folder = "unfiltered_dataset"
     output_folder = "processed_dataset"
     os.makedirs(output_folder, exist_ok=True)
+    in_path = os.path.join(input_folder, target)
+    out_path = os.path.join(output_folder, target)
+
+
+    progress = load_progress()
+    file_progress = progress.get('file', {})
     
-    # iterate over each file in the input folder
-    for fname in os.listdir(input_folder):
-        in_path = os.path.join(input_folder, fname)
-        out_path = os.path.join(output_folder, fname)
+    print("Updating: ", target)
 
-        print("Updating: ", fname)
-        if fname != "dataset_001.jsonl":
-            break
-
-        count = 1
-        with open(in_path, 'r') as infile, open(out_path, 'w') as outfile:
+    count = 1
+    with open(in_path, 'r') as infile, open(out_path, 'w') as outfile:
+        try:
             for line in infile:
                 print("Line " + str(count) + " is being evaluated")
                 count += 1
@@ -108,11 +142,17 @@ if __name__ == "__main__":
 
                 # get traced states
                 states = get_tactic_states_from_lean_code(full_code, project_path=".")
-                if states == ["FAILURE"]:
+                if states == ["FAILURE"] or states is None:
                     continue
                 item['tactic_states'] = states
 
                 # write the enriched JSON line
                 outfile.write(json.dumps(item) + "\n")
+                file_progress[target] = count
+                save_progress({'file': file_progress})
+        except Exception as e:
+            print(f"Error at line {count} in {target}: {e}")
+            save_progress({'file': file_progress})
+            raise
 
     print(f"Processed all files from '{input_folder}' into '{output_folder}'.")

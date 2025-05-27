@@ -48,10 +48,19 @@ def get_tactic_states_from_lean_code(lean_code: str, project_path: str = "."):
         print("Skipping proof containing 'have?'")
         return None
     lines = lean_code.splitlines()
-    try:
-        header_idx = next(i for i, l in enumerate(lines) if l.strip().endswith(':= by'))
-    except StopIteration:
+    header_idx = None
+    for i, l in enumerate(lines):
+        stripped = l.strip()
+        if stripped.endswith(':= by'):
+            header_idx = i
+            break
+        if re.match(r'^(theorem|lemma|def)\b', stripped) and stripped.endswith(':'):
+            header_idx = i
+            break
+
+    if header_idx is None:
         header_idx = next(i for i, l in enumerate(lines) if ':=' in l)
+
     file_ctx = lines[:header_idx]
     decl_header = lines[header_idx]
     body = [l for l in lines[header_idx+1:]]

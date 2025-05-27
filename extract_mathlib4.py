@@ -35,8 +35,8 @@ def extract_declarations_from_file(file_path):
 
 
     # Don't find block lemma thereoms comments as they are not verfied by lean server
-    block_doc_comment_start_regex = re.compile(r"^\s*/-!")
-    block_doc_comment_end_regex = re.compile(r"-!/")
+    block_doc_comment_start_regex = re.compile(r"^\s*/-")
+    block_doc_comment_end_regex = re.compile(r"-/")
 
     in_block_doc_comment = False
     i = 0
@@ -155,7 +155,7 @@ def main():
 
     
     # Split the data into seperate ones
-    chunk_size = 400
+    chunk_size = 6000
     for idx in range(0, len(all_theorems), chunk_size):
         chunk = all_theorems[idx: idx + chunk_size]
         file_index = idx // chunk_size + 1

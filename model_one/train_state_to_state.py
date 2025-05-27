@@ -13,15 +13,18 @@ from transformers import (
 from datasets import Dataset
 
 # Use torchrun --nproc_per_node=2 train_state_to_state.py
+# Use salloc --account=def-papyan --job-name=m_train_tactic --gpus-per-node=a100:2 --cpus-per-task=4 --mem=256GB --time=0-24:00
 
 # Configuration
 MODEL_NAME = "model"
 TRAIN_FILE = "dataset_001.jsonl"
 OUTPUT_DIR = "./sft_second_llm"
-BATCH_SIZE = 2
+BATCH_SIZE = 4
 LR = 5e-5
-EPOCHS = 3
-MAX_LENGTH = 256
+EPOCHS = 2
+MAX_LENGTH = 512
+LOGGING_STEPS = 4
+DATA_LOADERS = 4
 
 
 def load_transitions(jsonl_path):
@@ -96,11 +99,6 @@ def preprocess(examples, tokenizer):
     }
 
 def main():
-    if "LOCAL_RANK" in os.environ:
-        torch.distributed.init_process_group(backend="nccl")
-        rank = int(os.environ["LOCAL_RANK"])
-        torch.cuda.set_device(rank)
-    
     raw_examples = load_transitions(TRAIN_FILE)
 
     print("Generating Dataset")
@@ -141,7 +139,7 @@ def main():
         num_train_epochs=EPOCHS,
         eval_strategy="epoch",
         save_strategy="epoch",
-        logging_steps=1,
+        logging_steps=LOGGING_STEPS,
         save_total_limit=2,
         bf16=True,
         deepspeed={
@@ -151,7 +149,8 @@ def main():
             },
             "train_batch_size": "auto",
             "bf16": { "enabled": True }
-        }
+        },
+        dataloader_num_workers=DATA_LOADERS
     )
 
     trainer = Trainer(
@@ -164,7 +163,17 @@ def main():
 
     # Train and save
     print("IT's TRAINIGN TIME BABY")
-    trainer.train()
+    try:
+        trainer.train()
+    except KeyboardInterrupt:
+        print("Interrupted! Saving current model…")
+        trainer.save_model(OUTPUT_DIR)
+        return
+    except Exception as e:
+        print("DIED!")
+        trainer.save_model(OUTPUT_DIR)
+        return
+
 
     metrics = trainer.evaluate()
     print(metrics)

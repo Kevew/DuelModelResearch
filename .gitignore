@@ -1,5 +1,6 @@
 trainENV/
-sft_second_llm/
+model_one/model
+model_one/sft_second_llm
 processed_dataset/
 unfiltered_dataset/
 model/

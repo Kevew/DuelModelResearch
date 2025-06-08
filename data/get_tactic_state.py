@@ -1,8 +1,10 @@
+print("Starting up!")
 import json
 import re
 import os
 from lean_interact import LeanREPLConfig, LeanServer, Command, TempRequireProject, LeanRequire
 import argparse
+print("Loaded Imports")
 
 PROGRESS_FILE = "progress.json"
 
@@ -51,19 +53,27 @@ def get_tactic_states_from_lean_code(lean_code: str, project_path: str = "."):
     header_idx = None
     for i, l in enumerate(lines):
         stripped = l.strip()
-        if stripped.endswith(':= by'):
-            header_idx = i
-            break
-        if re.match(r'^(theorem|lemma|def)\b', stripped) and stripped.endswith(':'):
+        if re.match(r'^(theorem|lemma|def)\b', stripped):
             header_idx = i
             break
 
     if header_idx is None:
-        header_idx = next(i for i, l in enumerate(lines) if ':=' in l)
+        header_idx = next((i for i, l in enumerate(lines) if re.match(r'^(theorem|lemma|def)\b', l.strip())), 0)
 
     file_ctx = lines[:header_idx]
     decl_header = lines[header_idx]
     body = [l for l in lines[header_idx+1:]]
+
+    # Handle edge case: single-line "... := by " proofs
+    edge_match = re.search(r':=\sby\s.*|:=\s.+', decl_header)
+    if edge_match:
+        if ':= by' in decl_header:
+            sep = ':= by'
+        else:
+            sep = ':='
+        before, after = decl_header.split(sep, 1)
+        decl_header = before + sep
+        body.insert(0, after.strip())
 
     # Build full proof string
     proof_lines = [decl_header]
@@ -85,7 +95,9 @@ def get_tactic_states_from_lean_code(lean_code: str, project_path: str = "."):
         server.run(Command(cmd=ctx_line))
 
     # send the entire proof
+    print("sending proof")
     resp = server.run(Command(cmd=full_proof, root_goals=True, infotree="substantive"))
+    print("received proof")
     # extract states
     try:
         traced = extract_traced_states(resp, body)
@@ -119,7 +131,7 @@ if __name__ == "__main__":
 
     all_files = os.listdir("unfiltered_dataset")
     if target not in all_files:
-        print(f"Error: '{target}' not found in '{INPUT_FOLDER}'. Available files: {all_files}")
+        print(f"Error: '{target}' not found in '{all_files}'. Available files: {all_files}")
 
     input_folder = "unfiltered_dataset"
     output_folder = "processed_dataset"

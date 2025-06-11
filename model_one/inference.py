@@ -1,7 +1,7 @@
 from transformers import AutoTokenizer, AutoModelForCausalLM
 import torch
 
-model_name = "sft_second_llm"
+model_name = "lora_llm_distributed"
 
 tokenizer = AutoTokenizer.from_pretrained(model_name, local_files_only=True)
 model = AutoModelForCausalLM.from_pretrained(
@@ -17,13 +17,12 @@ inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
 
 outputs = model.generate(
     **inputs,
-    max_new_tokens=400,
+    max_new_tokens=128,
     eos_token_id=tokenizer.eos_token_id,
     pad_token_id=tokenizer.eos_token_id,
     do_sample=True,
     top_p=0.95,
     temperature=0.7,
-    early_stopping=True, 
     repetition_penalty=1.2
 )
 

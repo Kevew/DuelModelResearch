@@ -1,33 +1,55 @@
 import json
 from pathlib import Path
-import os
+import psutil, os
+
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 import torch
+import torch.distributed as dist
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, CPUOffload
+from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
+from torch.optim import AdamW
+from torch.distributed.fsdp import MixedPrecision
+
+
 from transformers import (
     AutoTokenizer,
     AutoModelForCausalLM,
-    Trainer,
-    TrainingArguments,
     DataCollatorForLanguageModeling,
+    get_linear_schedule_with_warmup
 )
 from datasets import Dataset
 
-# Use torchrun --nproc_per_node=2 train_state_to_state.py
+# Use torchrun --nproc_per_node=3 train_state_to_state.py
 # Use salloc --account=def-papyan --job-name=m_train_tactic --gpus-per-node=a100:2 --cpus-per-task=4 --mem=256GB --time=0-24:00
 
-# Configuration
-MODEL_NAME = "model"
-TRAIN_FILE = "dataset_001.jsonl"
-OUTPUT_DIR = "./sft_second_llm"
-BATCH_SIZE = 4
-LR = 5e-5
-EPOCHS = 2
-MAX_LENGTH = 512
-LOGGING_STEPS = 4
-DATA_LOADERS = 4
+mp_policy = MixedPrecision(
+    param_dtype=torch.bfloat16,
+    reduce_dtype=torch.bfloat16,
+    buffer_dtype=torch.bfloat16
+)
 
 
-def load_transitions(jsonl_path):
+class TrainConfig:
+    # Model and Data
+    model_name: str = "model"
+    train_file: str = "dataset_001.jsonl"
+    output_dir: str = "./sft_llm_fsdp"
+    
+    # Training parameters
+    batch_size: int = 1  # This will be the per-device batch size
+    lr: float = 5e-5
+    epochs: int = 2
+    max_length: int = 256
+    
+    # Distributed Training & Performance
+    num_workers: int = 4
+
+    # Logging and Saving
+    logging_steps: int = 4
+
+def load_transitions(jsonl_path, tokenizer):
     examples = []
     # Read line-by-line for JSONL
     with open(jsonl_path, 'r', encoding='utf-8') as f, open("data_for_training.jsonl", 'w', encoding='utf-8') as f_out:
@@ -51,7 +73,7 @@ def load_transitions(jsonl_path):
                     f"## Tactic State B:\n{to_state}\n"
                     "## Action:\n"
                 )
-                full_text = prompt + action_line
+                full_text = prompt + action_line + tokenizer.eos_token
                 examples.append({
                     "prompt": prompt,
                     "full_text": full_text
@@ -60,126 +82,174 @@ def load_transitions(jsonl_path):
     return examples
 
 
-def preprocess(examples, tokenizer):
+def preprocess(examples, tokenizer, max_length):
     # Tokenize prompts separately to get prompt lengths
     tokenized_prompt = tokenizer(
         examples['prompt'],
         truncation=True,
-        max_length=MAX_LENGTH,
+        max_length=max_length,
         padding='max_length',
     )
     tokenized_full = tokenizer(
         examples['full_text'],
         truncation=True,
-        max_length=MAX_LENGTH,
+        max_length=max_length,
         padding='max_length',
     )
 
     input_ids = tokenized_full['input_ids']
-    attention_mask = tokenized_full['attention_mask']
-    prompt_ids = tokenized_prompt['input_ids']
 
     labels = []
-    for idx, full_ids in enumerate(input_ids):
-        # Find how many tokens in prompt by counting non-pad tokens in prompt_ids[idx]
-        # Here, pad token id equals tokenizer.pad_token_id
-        pad_id = tokenizer.pad_token_id
-        # Count tokens until pad or full stop of prompt
-        prompt_token_count = sum(1 for t in prompt_ids[idx] if t != pad_id)
-        # Mask prompt tokens in labels
-        label_ids = full_ids.copy()
-        for i in range(prompt_token_count):
-            label_ids[i] = -100
-        labels.append(label_ids)
+    for i in range(len(input_ids)):
+        prompt_len = len(tokenized_prompt['input_ids'][i])
+        label = list(input_ids[i])  # Make a copy
+        # Mask out the prompt tokens by setting them to -100
+        label[:prompt_len] = [-100] * prompt_len
+        labels.append(label)
 
     return {
         'input_ids': input_ids,
-        'attention_mask': attention_mask,
+        'attention_mask': tokenized_full['attention_mask'],
         'labels': labels
     }
 
 def main():
-    raw_examples = load_transitions(TRAIN_FILE)
+    config = TrainConfig()
 
-    print("Generating Dataset")
+    # --- Distributed Setup ---
+    dist.init_process_group("nccl")
+    local_rank = int(os.environ["LOCAL_RANK"])
+    torch.cuda.set_device(local_rank)
+    device = torch.device("cuda", local_rank)
+    print(f"Running on rank {local_rank}.")
 
-    dataset = Dataset.from_list(raw_examples)
+    def log_system_state(prefix=""):
+        # GPU
+        alloc = torch.cuda.memory_allocated(device) >> 20
+        reserved = torch.cuda.memory_reserved(device) >> 20
+        # CPU
+        proc = psutil.Process(os.getpid())
+        rss = proc.memory_info().rss >> 20
+        print(f"[{prefix}] GPU alloc: {alloc} MiB, reserved: {reserved} MiB; CPU RSS: {rss} MiB")
+
+    def log_param_devices(prefix=""):
+        devs = {p.device for p in model.parameters()}
+        print(f"[{prefix}] parameter devices: {sorted(str(d) for d in devs)}")
+
+    # --- Tokenizer and Model ---
+    tokenizer = AutoTokenizer.from_pretrained(config.model_name, local_files_only=True)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
 
     print("Loading Model...")
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, local_files_only=True)
-    tokenizer.pad_token = tokenizer.eos_token
-    model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, local_files_only=True)
-    model.gradient_checkpointing_disable()
+    model = AutoModelForCausalLM.from_pretrained(
+        config.model_name,
+        local_files_only=True,
+        torch_dtype=torch.bfloat16
+    )
+    print(model)
 
+    log_system_state("before FSDP")
+    log_param_devices("before FSDP")
 
-    tokenized = dataset.map(
-        lambda x: preprocess(x, tokenizer),
-        batched=True,
-        remove_columns=["prompt", "full_text"],
+    print("Wrapping model with FSDP...")
+    model = FSDP(model, 
+        device_id=local_rank,
+        use_orig_params=True, 
+        sync_module_states=True,
+        mixed_precision=mp_policy
     )
 
-    print("Spilting data...")
-    # Split train/validation
-    split = tokenized.train_test_split(test_size=0.1)
-    train_dataset = split['train']
-    eval_dataset = split['test']
 
 
-    data_collator = DataCollatorForLanguageModeling(
-        tokenizer=tokenizer,
-        mlm=False,
+    log_system_state("after FSDP")
+    log_param_devices("after FSDP")
+
+    if local_rank == 0:
+        print("Loading and preparing dataset...")
+        raw_examples = load_transitions(config.train_file, tokenizer)
+        dataset = Dataset.from_list(raw_examples)
+        tokenized = dataset.map(
+            lambda x: preprocess(x, tokenizer, config.max_length),
+            batched=True,
+            remove_columns=["prompt", "full_text"],
+        )
+        split = tokenized.train_test_split(test_size=0.1)
+        train_dataset = split['train']
+        eval_dataset = split['test']
+        # Save to disk so other processes can load it
+        train_dataset.save_to_disk("train_dataset_cache")
+        eval_dataset.save_to_disk("eval_dataset_cache")
+
+
+    dist.barrier()
+
+    train_dataset = Dataset.load_from_disk("train_dataset_cache")
+    eval_dataset = Dataset.load_from_disk("eval_dataset_cache")
+
+    train_sampler = DistributedSampler(train_dataset, rank=local_rank, num_replicas=dist.get_world_size(), shuffle=True)
+    data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=config.batch_size,
+        sampler=train_sampler,
+        collate_fn=data_collator,
+        num_workers=config.num_workers
     )
 
-    training_args = TrainingArguments(
-        output_dir=OUTPUT_DIR,
-        overwrite_output_dir=True,
-        per_device_train_batch_size=BATCH_SIZE,
-        per_device_eval_batch_size=BATCH_SIZE,
-        learning_rate=LR,
-        num_train_epochs=EPOCHS,
-        eval_strategy="epoch",
-        save_strategy="epoch",
-        logging_steps=LOGGING_STEPS,
-        save_total_limit=2,
-        bf16=True,
-        deepspeed={
-            "zero_optimization": {
-                "stage": 2,
-                "offload_optimizer": { "device": "cpu" }
-            },
-            "train_batch_size": "auto",
-            "bf16": { "enabled": True }
-        },
-        dataloader_num_workers=DATA_LOADERS
-    )
 
-    trainer = Trainer(
-        model=model,
-        args=training_args,
-        train_dataset=train_dataset,
-        eval_dataset=eval_dataset,
-        data_collator=data_collator,
-    )
+    # --- Optimizer and Scheduler ---
+    optimizer = AdamW(model.parameters(), lr=config.lr)
+    total_training_steps = len(train_loader) * config.epochs
+    scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=0, num_training_steps=total_training_steps)
 
-    # Train and save
-    print("IT's TRAINIGN TIME BABY")
-    try:
-        trainer.train()
-    except KeyboardInterrupt:
-        print("Interrupted! Saving current model…")
-        trainer.save_model(OUTPUT_DIR)
-        return
-    except Exception as e:
-        print("DIED!")
-        trainer.save_model(OUTPUT_DIR)
-        return
+    print("Starting training...")
+    for epoch in range(config.epochs):
+        model.train()
+        train_sampler.set_epoch(epoch)
+        total_loss = 0.0
+        
+        print("Start of Epoch 1")
+        for step, batch in enumerate(train_loader):
+            if step == 0:
+               print(torch.cuda.memory_summary(device=device, abbreviated=True))
+            batch = {k: v.to(device) for k, v in batch.items()}
 
+            # Forward pass
+            outputs = model(**batch)
+            loss = outputs.loss
 
-    metrics = trainer.evaluate()
-    print(metrics)
+            # Backward pass and optimization
+            loss.backward()
 
-    trainer.save_model(OUTPUT_DIR)
+            if step == 0:
+                # Inspect where the gradients landed
+                grad_devs = {p.grad.device for p in model.parameters() if p.grad is not None}
+                print(f"[after backward] gradient devices: {grad_devs}")
 
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0) # Gradient clipping
+            optimizer.step()
+            scheduler.step()
+            optimizer.zero_grad()
+
+            total_loss += loss.item()
+
+            if step % config.logging_steps == 0 and local_rank == 0:
+                print(f"Epoch {epoch+1}/{config.epochs}, Step {step}, Loss: {loss.item():.4f}, LR: {scheduler.get_last_lr()[0]:.2e}")
+
+    if local_rank == 0:
+        print("Training finished. Saving model...")
+        dist.barrier()
+        with FSDP.state_dict_type(model, torch.distributed.fsdp.StateDictType.FULL_STATE_DICT):
+            cpu_state = model.state_dict()
+        unwrapped_model = AutoModelForCausalLM.from_pretrained(config.model_name, local_files_only=True)
+        unwrapped_model.load_state_dict(cpu_state)
+        unwrapped_model.save_pretrained(config.output_dir)
+        tokenizer.save_pretrained(config.output_dir)
+        print(f"Model saved to {config.output_dir}")
+
+    dist.destroy_process_group()
 
 if __name__ == "__main__":
     print("Starting Up!")

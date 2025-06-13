@@ -3,8 +3,70 @@ import re
 import json
 
 current_path = os.path.dirname(os.path.abspath(__file__))
-mathlib_path = os.path.join(current_path, "mathlib4") 
+parent_path = os.path.dirname(current_path)
+mathlib_path = os.path.join(parent_path, "mathlib4") 
 output_dir = os.path.join(current_path, "unfiltered_dataset")
+
+
+def split_simp_lines(text):
+    """
+    Splits multi-lemma simp and simp only calls into separate lines.
+
+    Example:
+        simp [a, b,
+              c]
+        => simp [a]\nsimp [b]\nsimp [c]
+    """
+    pattern = re.compile(
+        r"^([ \t]*)(simp(?:\s+only)?)\s*\[([^\]]+)\](.*)$",
+        re.MULTILINE
+    )
+
+    def repl(match):
+        indent = match.group(1)
+        command = match.group(2)  # 'simp' or 'simp only'
+        content = match.group(3)
+        rest = match.group(4)
+        # Ensure output uses 'simp only'
+        verb = 'simp only'
+        # Normalize lemmas list
+        lemmas = [lemma.strip() for lemma in content.replace('\n', ' ').split(',') if lemma.strip()]
+        # Reconstruct separate calls
+        lines = []
+        for lemma in lemmas:
+            lines.append(f"{indent}{verb} [{lemma}]{rest}")
+        return "\n".join(lines)
+
+    return pattern.sub(repl, text)
+
+def split_rw_lines(text):
+    """
+    Splits multi-lemma simp calls into separate lines.
+
+    Example:
+        rw [a, b,
+              c]
+        => rw [a]\nrw [b]\nrw [c]
+    """
+    pattern = re.compile(
+        r"^([ \t]*)rw\s*\[([^\]]+)\](.*)$",
+        re.MULTILINE
+    )
+
+    def repl(match):
+        indent = match.group(1)
+        content = match.group(2)
+        rest = match.group(3)
+        # Normalize lemmas list
+        lemmas = [lemma.strip() for lemma in content.replace('\n', ' ').split(',') if lemma.strip()]
+        # Reconstruct separate rw calls
+        lines = []
+        for lemma in lemmas:
+            lines.append(f"{indent}rw [{lemma}]{rest}")
+        return "\n".join(lines)
+
+    return pattern.sub(repl, text)
+
 
 
 def extract_declarations_from_file(file_path):
@@ -102,7 +164,7 @@ def extract_declarations_from_file(file_path):
 
             # record the declaration
             data.append({
-                "declaration": "\n".join(decl_lines),
+                "declaration": split_rw_lines(split_simp_lines("\n".join(decl_lines))),
                 "file": file_path,
                 "context": {
                     "open": list(open_context),

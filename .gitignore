@@ -3,6 +3,5 @@ model_one/model
 model_one/sft_second_llm
 model_two/model
 model_two/sft_second_llm
-processed_dataset/
 unfiltered_dataset/
 mathlib4/

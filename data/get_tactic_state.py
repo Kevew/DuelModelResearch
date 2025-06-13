@@ -2,9 +2,12 @@ print("Starting up!")
 import json
 import re
 import os
-from lean_interact import LeanREPLConfig, LeanServer, Command, TempRequireProject, LeanRequire
+from lean_interact import LeanREPLConfig, LeanServer, Command, TempRequireProject, LocalProject, ProofStep
+from lean_interact.interface import LeanError
+
 import argparse
 print("Loaded Imports")
+import time
 
 PROGRESS_FILE = "progress.json"
 
@@ -19,7 +22,7 @@ def save_progress(progress):
     with open(PROGRESS_FILE, 'w') as f:
         json.dump(progress, f)
 
-
+'''
 def extract_traced_states(resp, lines):
     """Collects goal states from resp.infotree: all goalsBefore plus final goalsAfter, and captures "Goals accomplished!"."""
     states = []
@@ -39,8 +42,9 @@ def extract_traced_states(resp, lines):
                 states.append(state_text)
                 tactic_idx += 1
     return states
+'''
 
-def get_tactic_states_from_lean_code(lean_code: str, project_path: str = "."):
+def get_tactic_states_from_lean_code(server: LeanServer, lean_code: str, initial_env):
     """
     Extracts the tactic state at each proof step using infotree.
 
@@ -49,75 +53,103 @@ def get_tactic_states_from_lean_code(lean_code: str, project_path: str = "."):
     if 'have?' in lean_code:
         print("Skipping proof containing 'have?'")
         return None
-    lines = lean_code.splitlines()
-    header_idx = None
-    for i, l in enumerate(lines):
-        stripped = l.strip()
-        if re.match(r'^(theorem|lemma|def)\b', stripped):
-            header_idx = i
-            break
+    # The incoming lean_code is wrapped in "section...end", so we can ignore them for parsing.
+    inner_code = "\n".join(lean_code.splitlines()[1:-1])
 
-    if header_idx is None:
-        header_idx = next((i for i, l in enumerate(lines) if re.match(r'^(theorem|lemma|def)\b', l.strip())), 0)
-
-    file_ctx = lines[:header_idx]
-    decl_header = lines[header_idx]
-    body = [l for l in lines[header_idx+1:]]
-
-    # Handle edge case: single-line "... := by " proofs
-    edge_match = re.search(r':=\sby\s.*|:=\s.+', decl_header)
-    if edge_match:
-        if ':= by' in decl_header:
-            sep = ':= by'
-        else:
-            sep = ':='
-        before, after = decl_header.split(sep, 1)
-        decl_header = before + sep
-        body.insert(0, after.strip())
-
-    # Build full proof string
-    proof_lines = [decl_header]
-    for line in body:
-        proof_lines.append(line)
-    full_proof = "\n".join(file_ctx + proof_lines)
-
-    # Setup Lean server
-    config = LeanREPLConfig(
-        lean_version="v4.19.0",
-        project=TempRequireProject([
-            LeanRequire(name="mathlib", git="https://github.com/leanprover-community/mathlib4.git", rev="v4.19.0")
-        ]),
-        verbose=False
-    )
-    server = LeanServer(config)
-    # load context
-    for ctx_line in file_ctx:
-        server.run(Command(cmd=ctx_line))
-
-    # send the entire proof
-    print("sending proof")
-    resp = server.run(Command(cmd=full_proof, root_goals=True, infotree="substantive"))
-    print("received proof")
-    # extract states
-    try:
-        traced = extract_traced_states(resp, body)
-    except Exception as e:
-        print(f"Skipping line due to error: {e}")
+    # Find where the proof body starts (after `:= by`)
+    match = re.search(r':=\s*by\b', inner_code)
+    if not match:
+        print(f"  > Error: Could not find ':= by' in the declaration.")
         return ["FAILURE"]
 
-    # label states: 'initial' from sorries, then each tactic's before-state
-    labels = ['(initial)'] + [l for l in body]
-    states = []
-    # If the first state isn't from infotree, use sorries
-    for label, state in zip(labels, traced):
-        states.append({"line": label, "tactic_state": state})
+    header_end_pos = match.start() + 2
+    header = inner_code[:header_end_pos].strip()
+    body_str = inner_code[match.end():]
     
-    server.kill()
+    # Filter out empty lines and comments from the proof body
+    proof_lines = []
+    for raw in body_str.splitlines():
+        txt = raw.strip()
+        if not txt or txt.startswith('--'):
+            continue
+        if txt.startswith("by "):
+            txt = txt[len("by "):]
+        proof_lines.append(txt)
+    states = []
+    initialization_code = f"section\n{header} sorry"
+    print(f"  > Sending header to get initial state...")
+    resp = server.run(Command(cmd=initialization_code, root_goals=True, env=initial_env))
+    
+    # Since this is in mathlib, sometimes this will find the theorem already declared so we gotta account for that
+    if any(
+        msg.severity == 'error' and "has already been declared" in msg.data
+        for msg in getattr(resp, "messages", [])
+    ):
+        header = re.sub(r"(theorem\s+)(\S+)", r"\1\2_extra", header, count=1)
+        initialization_code = f"section\n{header} sorry"
+        print(" > Name collision: retrying as: ")
+        resp = server.run(Command(cmd=initialization_code, root_goals=True, env=initial_env))
+
+    initial_goals = []
+    initial_sorries = getattr(resp, 'sorries', [])
+    if initial_sorries:
+        initial_goals = [s.goal for s in initial_sorries]
+    else:
+        initial_goals = getattr(resp, 'goalsAfter', [])
+    print(initialization_code)
+    if not initial_goals:
+        # Check if the goal was solved immediately
+        if any("Goals accomplished!" in log.get('msg', '') for log in getattr(resp, 'log', [])):
+             initial_state_text = "Goals accomplished!"
+             states.append({"line": "(initial)", "tactic_state": initial_state_text})
+             if proof_lines:
+                states.append({"line": proof_lines[0], "tactic_state": "Goals accomplished!"})
+             return states
+        else:
+            print("  > Warning: No initial goals found. There might be an error in the declaration.")
+            return ["FAILURE"]
+    initial_state_text = "\n---\n".join(initial_goals)
+    states.append({"line": "(initial)", "tactic_state": initial_state_text})
+
+    proof_state_id = getattr(resp.sorries[0], 'proof_state', [])
+    for tactic_line in proof_lines:
+        print(tactic_line)
+        resp = server.run(ProofStep(tactic=tactic_line, proof_state=proof_state_id))
+        # For some reason, stuff like lift aint working
+        if isinstance(resp, LeanError):
+            return ["FAILURE"]
+        proof_state_id = resp.proof_state
+        
+        current_goals = getattr(resp, 'goals', [])
+        state_text = ""
+
+        if resp.proof_status == "Incomplete: open goals remain":
+            state_text = "\n---\n".join(current_goals)
+        else:
+            state_text = "No Goals!"
+
+        states.append({"line": tactic_line, "tactic_state": state_text})
+        
+        # If the goal is solved, we can stop early.
+        if state_text == "Goals accomplished!":
+            break
+
+    # --- 4. Close the section to keep the environment clean ---
+    server.run(Command(cmd="end"))
+
     return states
 
 
-if __name__ == "__main__":
+def create_server(config):
+    server = LeanServer(config)
+    print("✅ Lean Server is ready.")
+    print("Importing Mathlib for the session... This may take a moment.")
+    mathlib_resp = server.run(Command(cmd="import Mathlib"))
+    print(f"✅ Mathlib imported (env={mathlib_resp.env}).")
+    return server, mathlib_resp.env
 
+
+if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Process a single Lean dataset file to extract tactic states."
     )
@@ -139,6 +171,13 @@ if __name__ == "__main__":
     in_path = os.path.join(input_folder, target)
     out_path = os.path.join(output_folder, target)
 
+    config = LeanREPLConfig(
+        lean_version="v4.19.0",
+        project=LocalProject("/home/kevew/scratch/DuelModelResearch/mathlib4"),
+        verbose=True
+    )
+    server, initial_env = create_server(config)
+
 
     progress = load_progress()
     file_progress = progress.get('file', {})
@@ -146,34 +185,52 @@ if __name__ == "__main__":
     print("Updating: ", target)
 
     count = 1
-    with open(in_path, 'r') as infile, open(out_path, 'w') as outfile:
-        try:
+    try:
+        with open(in_path, 'r') as infile, open(out_path, 'w') as outfile:
             for line in infile:
-                print("Line " + str(count) + " is being evaluated")
+                print(f"Line {count} is being evaluated")
                 count += 1
+
+                if (count - 1) % 100 == 0 and count > 1:
+                    print(f"\n--- Restarting Lean Server after 100 items ---\n")
+                    server.kill()
+                    server, initial_env = create_server(config)
+
                 item = json.loads(line)
-                print("Evaluting from: " +  item["file"])
-                # assemble full Lean code with imports, opens, and variables
-                full_code = "import Mathlib\n"
+                print("Evaluating from: " + item["file"])
+                start_time = time.time()
+
+                full_code = "section\n"                 
                 for o in item['context'].get('open', []):
                     full_code += f"open {o}\n"
                 for v in item['context'].get('variables', []):
                     full_code += f"variable {v}\n"
+                
                 full_code += item['declaration']
+                full_code += "\nend" # End the section
 
-                # get traced states
-                states = get_tactic_states_from_lean_code(full_code, project_path=".")
+                states = get_tactic_states_from_lean_code(server, full_code, initial_env)
+
+                end_time = time.time()
+                duration = end_time - start_time
+                print(f"  > Processed in {duration:.2f} seconds.") # Optional: for real-time feedback
+
+                
                 if states == ["FAILURE"] or states is None:
                     continue
+                
                 item['tactic_states'] = states
-
-                # write the enriched JSON line
                 outfile.write(json.dumps(item) + "\n")
                 file_progress[target] = count
                 save_progress({'file': file_progress})
-        except Exception as e:
-            print(f"Error at line {count} in {target}: {e}")
-            save_progress({'file': file_progress})
-            raise
+
+    except Exception as e:
+        print(f"An error occurred at line {count} in {target}: {e}")
+        save_progress({'file': file_progress})
+        raise
+    finally:
+        print("Shutting down Lean Server.")
+        server.kill()
+
 
     print(f"Processed all files from '{input_folder}' into '{output_folder}'.")

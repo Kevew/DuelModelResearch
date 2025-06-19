@@ -10,25 +10,24 @@ output_dir = os.path.join(current_path, "unfiltered_dataset")
 
 def split_simp_lines(text):
     """
-    Splits multi-lemma simp and simp only calls into separate lines.
+    Splits multi-lemma `simp only` calls into separate lines.
 
     Example:
-        simp [a, b,
-              c]
-        => simp [a]\nsimp [b]\nsimp [c]
+        simp only [a, b,
+                   c]
+        => simp only [a]\nsimp only [b]\nsimp only [c]
     """
     pattern = re.compile(
-        r"^([ \t]*)(simp(?:\s+only)?)\s*\[([^\]]+)\](.*)$",
+        r"^([ \t]*)(simp only)\s*\[([^\]]+)\](.*)$",
         re.MULTILINE
     )
 
     def repl(match):
         indent = match.group(1)
-        command = match.group(2)  # 'simp' or 'simp only'
+        # 'simp only'
+        verb = match.group(2)
         content = match.group(3)
         rest = match.group(4)
-        # Ensure output uses 'simp only'
-        verb = 'simp only'
         # Normalize lemmas list
         lemmas = [lemma.strip() for lemma in content.replace('\n', ' ').split(',') if lemma.strip()]
         # Reconstruct separate calls

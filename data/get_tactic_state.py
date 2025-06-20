@@ -163,7 +163,7 @@ def get_tactic_states_from_lean_code(server: LeanServer, lean_code: str, initial
         initialization_code = f"section\n{header} sorry"
         resp = server.run(Command(cmd=initialization_code, root_goals=True, env=initial_env))
 
-
+    print(initialization_code)
     initial_goals = getattr(resp, 'sorries', [])[0].goal if getattr(resp, 'sorries', []) else getattr(resp, 'goalsAfter', [])
     if not initial_goals:
         print("  > Warning: No initial goals found.")
@@ -197,6 +197,7 @@ def get_tactic_states_from_lean_code(server: LeanServer, lean_code: str, initial
             new_theorem_code = generate_theorem_from_have(current_tactic_state, new_theorem_name, have_decl, have_proof)
             newly_generated_theorems.append({'declaration': new_theorem_code})
             tactic = f"have {have_decl} := sorry"
+        print(tactic)
         resp = server.run(ProofStep(tactic=tactic, proof_state=proof_state_id))
         # For some reason, stuff like lift aint working
         if isinstance(resp, LeanError):
@@ -214,6 +215,7 @@ def get_tactic_states_from_lean_code(server: LeanServer, lean_code: str, initial
         states.append({"line": tactic, "tactic_state": state_text})
     global SUCCESS_COUNT
     SUCCESS_COUNT += 1
+    print("Success")
     server.run(Command(cmd="end"))
     return states, newly_generated_theorems
 
@@ -259,15 +261,17 @@ if __name__ == "__main__":
 
     progress = load_progress()
     file_progress = progress.get('file', {})
+    last_done = file_progress.get(target, 0)
     
     print("Updating: ", target)
 
     count = 1
     try:
-        with open(in_path, 'r') as infile, open(out_path, 'w') as outfile:
+        with open(in_path, 'r') as infile, open(out_path, 'a') as outfile:
             for line in infile:
-                print(f"Line {count} is being evaluated")
                 count += 1
+                if count <= last_done:
+                    continue
 
                 if (count - 1) % 100 == 0 and count > 1:
                     # I got a error earlier about the server being overloaded
@@ -275,6 +279,8 @@ if __name__ == "__main__":
                     print(f"\n--- Restarting Lean Server after 100 items ---\n")
                     server.kill()
                     server, initial_env = create_server(config)
+
+                print(f"Line {count} is being evaluated")
 
                 item = json.loads(line)
                 start_time = time.time()
@@ -298,7 +304,7 @@ if __name__ == "__main__":
                 if states == ["FAILURE"] or states is None or isinstance(states, LeanError):
                     if isinstance(states, LeanError):
                         with open("fail.txt", "a") as myfile:
-                            myfile.write(str(states) + '\n')
+                            myfile.write(str(states) + f" - Line {count}" + '\n')
                     continue
                 
                 item['tactic_states'] = states
@@ -320,6 +326,7 @@ if __name__ == "__main__":
         save_progress({'file': file_progress})
         raise
     finally:
+        save_progress({'file': file_progress})
         print("Shutting down Lean Server.")
         server.kill()
         print("Succesfully generated: " + str(SUCCESS_COUNT))

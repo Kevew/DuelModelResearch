@@ -7,6 +7,39 @@ parent_path = os.path.dirname(current_path)
 mathlib_path = os.path.join(parent_path, "mathlib4") 
 output_dir = os.path.join(current_path, "unfiltered_dataset")
 
+def consolidate_simpa_lines(text):
+    """
+    Consolidates multi-line `simpa only` calls into a single line.
+
+    Example:
+        simpa only [a, b,
+                          c] at h1
+        => simpa only [a,b,c] at h1
+    """
+    pattern = re.compile(
+        r"^([ \t]*)(·\s+)?(simpa only)\s*\[([\s\S]+?)\](.*)$",
+        re.MULTILINE
+    )
+
+    def repl(match):
+        indent = match.group(1)
+        bullet = match.group(2) or ""
+        verb = match.group(3)
+        content = match.group(4)
+        rest = match.group(5)
+
+
+        lemmas = [
+            lemma.strip()
+            for lemma in content.replace('\n', ' ').split(',')
+            if lemma.strip()
+        ]
+        consolidated_content = ",".join(lemmas)
+
+        return f"{indent}{bullet}{verb} [{consolidated_content}]{rest}"
+
+    return pattern.sub(repl, text)
+
 
 def split_simp_lines(text):
     """
@@ -161,9 +194,14 @@ def extract_declarations_from_file(file_path):
                 else:
                     break
 
+            declaration_content = "\n".join(decl_lines)
+            declaration_content = consolidate_simpa_lines(declaration_content)
+            declaration_content = split_simp_lines(declaration_content)
+            declaration_content = split_rw_lines(declaration_content)
+
             # record the declaration
             data.append({
-                "declaration": split_rw_lines(split_simp_lines("\n".join(decl_lines))),
+                "declaration": declaration_content,
                 "file": file_path,
                 "context": {
                     "open": list(open_context),

@@ -24,6 +24,10 @@
     "offload_param": {
       "device": "cpu"
     },
+    "offload_optimizer": { 
+      "device": "cpu",
+      "pin_memory": true
+    },
     "overlap_comm": true,
     "contiguous_gradients": true
   },
@@ -31,6 +35,9 @@
     "enabled": true,
     "loss_scale": 0,
     "initial_scale_power": 16
+  },
+  "activation_checkpointing": {
+    "partition_activations": true
   },
   "wall_clock_breakdown": false
 }

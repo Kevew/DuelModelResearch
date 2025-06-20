@@ -16,7 +16,6 @@ from transformers import (
 
 import deepspeed
 
-
 class TrainConfig:
     model_name: str = "model"
     hf_dataset: str = "Kevew/mathlib4_tactics"
@@ -24,6 +23,9 @@ class TrainConfig:
     output_dir: str = "./sft_llm_deepspeed"
     max_length: int = 256
     num_workers: int = 4
+
+    epochs: int = 2
+    logging_steps: int = 10
 
 
 def load_transitions(jsonl_path, tokenizer):
@@ -123,27 +125,29 @@ def main():
         model_parameters=model.parameters()
     )
 
-    # Training loop
-    for epoch in range(0, ds_engine.num_epochs):
-        ds_engine.train()
-        sampler.set_epoch(epoch)
-        for step, batch in enumerate(train_loader):
-            batch = {k: v.cuda(non_blocking=True) for k, v in batch.items()}
-            loss = ds_engine(**batch).loss
-            ds_engine.backward(loss)
-            ds_engine.step()
+    try:
+        # Training loop
+        for epoch in range(config.epochs):
+            ds_engine.train()
+            sampler.set_epoch(epoch)
+            for step, batch in enumerate(train_loader):
+                batch = {k: v.cuda(non_blocking=True) for k, v in batch.items()}
+                loss = ds_engine(**batch).loss
+                ds_engine.backward(loss)
+                ds_engine.step()
 
-            if step % ds_engine.global_steps_per_print == 0 and local_rank == 0:
-                lr = scheduler.get_last_lr()[0]
-                print(f"Epoch {epoch+1}, Step {step}, Loss: {loss.item():.4f}, LR: {lr:.2e}")
-
-    # Save only on rank 0
-    if local_rank == 0:
-        ds_engine.save_checkpoint(config.output_dir)
-        tokenizer.save_pretrained(config.output_dir)
-        print(f"Checkpoint + tokenizer saved to {config.output_dir}")
-
-    dist.destroy_process_group()
+                if step % config.logging_steps == 0 and local_rank == 0:
+                    lr = scheduler.get_last_lr()[0]
+                    print(f"Epoch {epoch+1}, Step {step}, Loss: {loss.item():.4f}, LR: {lr:.2e}")
+    except KeyboardInterrupt:
+        print("\nReceived KeyboardInterrupt. Saving model before exit...")
+        if local_rank == 0:
+            save_model(ds_engine, tokenizer, config.output_dir)
+    else:
+        if local_rank == 0:
+            save_model(ds_engine, tokenizer, config.output_dir)
+    finally:
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":

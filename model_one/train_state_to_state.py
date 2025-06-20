@@ -12,6 +12,8 @@ from torch.utils.data.distributed import DistributedSampler
 from torch.optim import AdamW
 from torch.distributed.fsdp import MixedPrecision
 
+from datasets import load_dataset
+
 
 from transformers import (
     AutoTokenizer,
@@ -34,13 +36,14 @@ mp_policy = MixedPrecision(
 class TrainConfig:
     # Model and Data
     model_name: str = "model"
-    train_file: str = "dataset_001.jsonl"
+    hf_dataset: str = "Kevew/mathlib4_tactics"
+    hf_split: str = "train"
     output_dir: str = "./sft_llm_fsdp"
     
     # Training parameters
-    batch_size: int = 1  # This will be the per-device batch size
+    batch_size: int = 32  # This will be the per-device batch size
     lr: float = 5e-5
-    epochs: int = 2
+    epochs: int = 5
     max_length: int = 256
     
     # Distributed Training & Performance
@@ -69,6 +72,7 @@ def load_transitions(jsonl_path, tokenizer):
                 action_line = states[i+1]['line']
                 # Build prompt/target
                 prompt = (
+                    f"Generate the lean 4 code to go from tactic state A to B. \n"
                     f"## Tactic State A:\n{from_state}\n"
                     f"## Tactic State B:\n{to_state}\n"
                     "## Action:\n"
@@ -167,8 +171,13 @@ def main():
 
     if local_rank == 0:
         print("Loading and preparing dataset...")
-        raw_examples = load_transitions(config.train_file, tokenizer)
-        dataset = Dataset.from_list(raw_examples)
+        hf_ds = load_dataset(config.hf_dataset, split=config.hf_split)
+        tmp_path = "hf_data.jsonl"
+        with open(tmp_path, 'w', encoding='utf-8') as fout:
+            for item in hf_ds:
+                fout.write(json.dumps(item, ensure_ascii=False) + '\n')
+        examples = load_transitions(tmp_path, tokenizer)
+        dataset = Dataset.from_list(examples)
         tokenized = dataset.map(
             lambda x: preprocess(x, tokenizer, config.max_length),
             batched=True,

@@ -3,6 +3,7 @@ import re
 import os
 from lean_interact import LeanREPLConfig, LeanServer, Command, TempRequireProject, LocalProject, ProofStep
 from lean_interact.interface import LeanError
+from typing import Any, Dict, List
 
 import argparse
 print("Loaded Imports")
@@ -16,109 +17,38 @@ def load_progress():
             return json.load(f)
     return {}
 
-
 def save_progress(progress):
     with open(PROGRESS_FILE, 'w') as f:
         json.dump(progress, f)
 
-def tactic_state_to_theorem(tactic_state: str, theorem_name: str = "my_theorem") -> str:
+
+def extract_tactic_data(cmd_resp: Any) -> List[Dict[str, Any]]:
     """
-    Converts a Lean 4 tactic state string into a Lean 4 theorem.
-
-    Args:
-        tactic_state: A string representing the Lean 4 tactic state.
-        theorem_name: The desired name for the generated theorem.
-
-    Returns:
-        A string representing the Lean 4 theorem.
+    Traverses the CommandResponse.infotree to extract a dataset of tactics.
     """
-    # Split the tactic state into lines
-    lines = tactic_state.strip().split('\n')
+    dataset: List[Dict[str, Any]] = []
 
-    # The last line is the goal, everything before is hypotheses
-    goal = lines[-1].replace("⊢ ", "").strip()
-    hypotheses = lines[:-1]
+    def recurse(tree: Any) -> None:
+        tactic = getattr(tree.node.stx, 'pp', None)
+        before = getattr(tree.node, 'goals_before', []) or []
+        after = getattr(tree.node, 'goals_after', []) or []
+        
+        # Only add entries that have a tactic and a before state
+        if tactic and before:
+            dataset.append({
+                'tactic': tactic,
+                'before_state': before,
+                'after_state': after
+            })
 
-    # Process hypotheses to extract variable names and types
-    processed_hypotheses = []
-    for h in hypotheses:
-        if ":" in h:
-            # Regular expression to handle potential dependencies in hypotheses
-            match = re.match(r"(\w+)\s*:\s*(.*)", h.strip())
-            if match:
-                var_name = match.group(1)
-                var_type = match.group(2).strip()
-                processed_hypotheses.append(f"({var_name} : {var_type})")
+        for child in getattr(tree, 'children', []):
+            recurse(child)
 
-    # Construct the theorem signature
-    theorem_signature = f"theorem {theorem_name} " + " ".join(processed_hypotheses) + f" : {goal} :="
+    for root in getattr(cmd_resp, 'infotree', []):
+        recurse(root)
 
-    # Add a placeholder for the proof
-    proof = "  sorry"
+    return dataset
 
-    # Combine to form the final theorem
-    return f"{theorem_signature}\n{proof}"
-
-def generate_theorem_from_have(tactic_state: str, theorem_name: str, have_decl: str, have_proof: str) -> str:
-    """
-    Generates a complete theorem from a 'have' statement and the current tactic state.
-    
-    Args:
-        tactic_state: The tactic state providing the hypotheses.
-        theorem_name: The name for the new theorem.
-        have_decl: The declaration part of the have (e.g., 'h : P').
-        have_proof: The proof part of the have (e.g., 'by assumption').
-
-    Returns:
-        A string representing the complete Lean 4 theorem.
-    """
-    # The goal of our new theorem is the proposition from the 'have' statement.
-    goal = have_decl.split(':', 1)[-1].strip()
-    
-    # Reconstruct the tactic state with the correct goal for the 'have' proposition.
-    lines = tactic_state.strip().split('\n')
-    hypotheses = [line for line in lines if not line.startswith('⊢')]
-    new_tactic_state = '\n'.join(hypotheses) + f'\n⊢ {goal}'
-
-    # Use the existing function to create the theorem shell (header + signature).
-    theorem_shell = tactic_state_to_theorem(new_tactic_state, theorem_name)
-
-    # Replace the 'sorry' with the actual proof from the 'have' statement.
-    proof_body = have_proof.strip()
-    if not proof_body.startswith("by"):
-        proof_body = f"by {proof_body}"
-    
-    final_theorem = theorem_shell.replace("  sorry", f"  {proof_body}")
-    return final_theorem
-
-
-def group_proof_steps(body_str: str):
-    """
-    Groups lines of a proof body into distinct tactic steps based on indentation.
-    This is a heuristic and may not be perfect for all Lean syntax.
-    """
-    steps = []
-    lines = [line for line in body_str.splitlines() if line.strip() and not line.strip().startswith('--')]
-    if not lines:
-        return []
-
-    current_step = lines[0]
-    base_indent = len(lines[0]) - len(lines[0].lstrip(' '))
-
-    for i in range(1, len(lines)):
-        line = lines[i]
-        indent = len(line) - len(line.lstrip(' '))
-        # If indentation increases, it's part of the current tactic.
-        # If it's the same or less, it's a new tactic.
-        if indent > base_indent:
-            current_step += "\n" + line
-        else:
-            steps.append(current_step.strip())
-            current_step = line
-            base_indent = indent
-    
-    steps.append(current_step.strip())
-    return steps
 
 SUCCESS_COUNT = 0
 
@@ -126,99 +56,60 @@ SUCCESS_COUNT = 0
 def get_tactic_states_from_lean_code(server: LeanServer, lean_code: str, initial_env):
     """
     Extracts the tactic state at each proof step using infotree.
-
-    Send the entire proof in one command, then walk through infotree to record each intermediate goal.
     """
-    if 'have?' in lean_code:
-        print("Skipping proof containing 'have?'")
-        return None, []
-    newly_generated_theorems = []
-    # The incoming lean_code is wrapped in "section...end", so we can ignore them for parsing.
-    inner_code = "\n".join(lean_code.splitlines()[1:-1])
-    match_hdr = re.search(r"\b(?:theorem|lemma)\s+(\w+)", inner_code)
-    theorem_name = match_hdr.group(1) if match_hdr else "my_theorem"
+    # 1. Create a single command for the entire proof with infotree enabled
+    cmd = Command(
+        cmd=lean_code,
+        env=initial_env,
+        infotree="substantive"  # This flag is crucial
+    )
+    resp = server.run(cmd)
 
-
-    # Find where the proof body starts (after `:= by`)
-    match = re.search(r':=\s*by\b', inner_code)
-    if not match:
-        print(f"  > Error: Could not find ':= by' in the declaration.")
-        return ["FAILURE"], []
-
-
-    header_end_pos = match.start() + 2
-    header = inner_code[:header_end_pos].strip()
-    body_str = inner_code[match.end():]
-    
-    
-    proof_steps = group_proof_steps(body_str)
-
-    states = []
-    initialization_code = f"section\n{header} sorry"
-    resp = server.run(Command(cmd=initialization_code, root_goals=True, env=initial_env))
-    # Since this is in mathlib, sometimes this will find the theorem already declared so we gotta account for that
-    if any(msg.severity == 'error' and "has already been declared" in msg.data
-        for msg in getattr(resp, "messages", [])):
-        header = re.sub(r"((?:theorem|lemma)\s+)(\S+)", r"\1\2_extra", header, count=1)
-        initialization_code = f"section\n{header} sorry"
-        resp = server.run(Command(cmd=initialization_code, root_goals=True, env=initial_env))
-
-    print(initialization_code)
-    initial_goals = getattr(resp, 'sorries', [])[0].goal if getattr(resp, 'sorries', []) else getattr(resp, 'goalsAfter', [])
-    if not initial_goals:
-        print("  > Warning: No initial goals found.")
-        return ["FAILURE"], []
-
-    states.append({"line": "(initial)", "tactic_state": initial_goals})
-
-    proof_state_id = getattr(resp.sorries[0], 'proof_state', None)
-    if not proof_state_id:
-        return ["FAILURE"], []
-
-    current_tactic_state = initial_goals
-
-    for tactic_line in proof_steps:
-        tactic = tactic_line
-        match_have = re.match(
-            r"^have\s+(?:(\w+)\s*:\s*)?([^=]+)\s*:=\s*by\b(.*)",
-            tactic.strip(),
-            re.DOTALL
-        )
-        if match_have:
-            have_name_group = match_have.group(1)
-            have_type = match_have.group(2).strip()
-            have_proof = match_have.group(3).strip()
-            # Build declaration, handling optional name
-            if have_name_group:
-                have_decl = f"{have_name_group} : {have_type}"
-            else:
-                have_decl = f": {have_type}"
-            new_theorem_name = f"{theorem_name}_have_{len(newly_generated_theorems) + 1}"
-            new_theorem_code = generate_theorem_from_have(current_tactic_state, new_theorem_name, have_decl, have_proof)
-            newly_generated_theorems.append({'declaration': new_theorem_code})
-            tactic = f"have {have_decl} := sorry"
-        print(tactic)
-        resp = server.run(ProofStep(tactic=tactic, proof_state=proof_state_id))
-        # For some reason, stuff like lift aint working
-        if isinstance(resp, LeanError):
-            return resp, []
-        proof_state_id = resp.proof_state
-        
-        proof_state_id = resp.proof_state
-        state_text = ""
-        if resp.proof_status == "Incomplete: open goals remain":
-            state_text = "\n---\n".join(resp.goals)
+    # 2. Handle errors, including retrying on name clashes
+    if isinstance(resp, LeanError):
+        # Retry once if the theorem name already exists
+        if "has already been declared" in str(resp.message):
+            modified_code = re.sub(r"((?:theorem|lemma)\s+)(\S+)", r"\1\2_extra", lean_code, count=1)
+            cmd_retry = Command(cmd=modified_code, env=initial_env, infotree="substantive")
+            resp = server.run(cmd_retry)
+            if isinstance(resp, LeanError):
+                return resp, []
         else:
-            state_text = "No Goals!"
+            return resp, []
+            
+    if not getattr(resp, 'infotree', None):
+        return ["FAILURE"]
+
+    # 3. Extract the tactic data from the infotree
+    tactic_data = extract_tactic_data(resp)
+    if not tactic_data:
+        return ["FAILURE"], []
+
+    # 4. Format the extracted data to match the script's expected output
+    states = []
+    # Add the initial goal state from the very first tactic encountered
+    initial_goals = tactic_data[0]['before_state']
+    states.append({"line": "(initial)", "tactic_state": "\n---\n".join(initial_goals)})
+
+    # Process each subsequent tactic
+    for step in tactic_data:
+        tactic_text = step['tactic'].strip()
+        after_state_text = "\n---\n".join(step['after_state'])
+
+        if (after_state_text == ""):
+            states.append({"line": tactic_text, "tactic_state": "No Goals!"})
+            break
         
-        current_tactic_state = state_text
-        states.append({"line": tactic, "tactic_state": state_text})
+        states.append({"line": tactic_text, "tactic_state": after_state_text})
+    
+    if states[-1]["tactic_state"] != "No Goals!":
+        return ["FAILURE"]
+
     global SUCCESS_COUNT
     SUCCESS_COUNT += 1
     print("Success")
-    server.run(Command(cmd="end"))
-    return states, newly_generated_theorems
-
+    
+    return states
 
 def create_server(config):
     server = LeanServer(config)
@@ -294,7 +185,7 @@ if __name__ == "__main__":
                 full_code += item['declaration']
                 full_code += "\nend" # End the section
 
-                states, new_theorems = get_tactic_states_from_lean_code(server, full_code, initial_env)
+                states = get_tactic_states_from_lean_code(server, full_code, initial_env)
 
                 end_time = time.time()
                 duration = end_time - start_time
@@ -302,21 +193,10 @@ if __name__ == "__main__":
 
                 
                 if states == ["FAILURE"] or states is None or isinstance(states, LeanError):
-                    if isinstance(states, LeanError):
-                        with open("fail.txt", "a") as myfile:
-                            myfile.write(str(states) + f" - Line {count}" + '\n')
                     continue
                 
                 item['tactic_states'] = states
                 outfile.write(json.dumps(item) + "\n")
-
-                # Write the newly generated theorems from 'have' statements to the output
-                for new_theorem_item in new_theorems:
-                    # These new items inherit the context of the parent theorem
-                    new_item_to_write = {'context': item['context'], 'declaration': new_theorem_item['declaration']}
-                    with open("extra.txt", "a") as myfile:
-                        myfile.write(json.dumps(new_item_to_write) + "\n")
-                    print(f"  > Generated and saved new theorem from 'have': {new_theorem_item['declaration'].split(':=', 1)[0]}")
 
                 file_progress[target] = count
                 save_progress({'file': file_progress})
